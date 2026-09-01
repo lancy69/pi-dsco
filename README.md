@@ -1,3 +1,5 @@
+![Banner](assets/pi-dsco-banner.png)
+
 # pi-dsco
 
 This is a [Pi Coding Agent](https://pi.dev) plugin.

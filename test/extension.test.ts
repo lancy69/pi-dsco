@@ -8,10 +8,10 @@ import { stream } from "@earendil-works/pi-ai/api/openai-completions";
 import type { Context, Model } from "@earendil-works/pi-ai";
 import {
   createAgentSession, createBashTool, createReadTool, discoverAndLoadExtensions,
-  ModelRuntime, SessionManager, SettingsManager,
+  ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
-import { canonicalize, inScope, observe, projectPayload } from "../index.ts";
+import dsco, { canonicalize, inScope, observe, projectPayload } from "../index.ts";
 
 const model: Model<"openai-completions"> = {
   id: "deepseek-v4-pro", name: "Mock DeepSeek", provider: "deepseek",
@@ -113,6 +113,69 @@ test("diagnostics distinguish first, repeated, appended and intentionally change
     observe({ messages: [] }).shape?.tools,
     createHash("sha256").update("undefined").digest("hex"),
   );
+});
+
+test("extension wiring reports and resets request identity", async () => {
+  const handlers = new Map<string, (...args: any[]) => any>();
+  let flagRegistration: { name: string; options: unknown } | undefined;
+  let commandRegistration: { name: string; options: any } | undefined;
+  let optIn = false;
+  dsco({
+    registerFlag: (name: string, options: unknown) => { flagRegistration = { name, options }; },
+    registerCommand: (name: string, options: unknown) => { commandRegistration = { name, options }; },
+    on: (name: string, handler: (...args: any[]) => any) => { handlers.set(name, handler); },
+    getFlag: () => optIn,
+  } as unknown as ExtensionAPI);
+
+  assert.deepEqual([...handlers.keys()], ["session_start", "model_select", "before_provider_request"]);
+  assert.deepEqual(flagRegistration, {
+    name: "dsco-compatible",
+    options: {
+      description: "Opt in the current OpenAI-compatible endpoint to tool ordering (does not establish DeepSeek caching)",
+      type: "boolean",
+      default: false,
+    },
+  });
+  assert.equal(commandRegistration?.name, "dsco");
+  assert.equal(commandRegistration?.options.description, "Show local prefix stability; Pi's footer reports actual cache usage");
+
+  const notices: Array<{ message: string; level: string }> = [];
+  const status = async () => {
+    await commandRegistration!.options.handler("", {
+      ui: { notify: (message: string, level: string) => notices.push({ message, level }) },
+    });
+    return notices.at(-1)!;
+  };
+  const expected = (message: string) => ({
+    message: `${message}\nCompared at this hook only; later hooks may change the request. Pi's footer reports provider cache-read usage.`,
+    level: "info",
+  });
+  assert.deepEqual(await status(), expected("No scoped request observed."));
+
+  const request = { messages: [{ role: "user", content: "hello" }], tools: [tool("a")] };
+  const context = (sessionId: string, selected: Model<"openai-completions"> = model) => ({
+    model: selected,
+    modelRegistry: { isUsingOAuth: () => false, getRegisteredProviderIds: () => [] },
+    sessionManager: { getSessionId: () => sessionId },
+  });
+  const beforeRequest = handlers.get("before_provider_request")!;
+
+  beforeRequest({ payload: request }, context("one"));
+  assert.deepEqual(await status(), expected("First observed request (also after resume); server cache warmth unknown."));
+  handlers.get("session_start")!();
+  assert.deepEqual(await status(), expected("No scoped request observed."));
+
+  beforeRequest({ payload: request }, context("one"));
+  beforeRequest({ payload: request }, context("one", { ...model, baseUrl: "https://gateway.example/v1" }));
+  assert.deepEqual(await status(), expected("Inactive for this endpoint or API; request unchanged."));
+  beforeRequest({ payload: request }, context("one"));
+  assert.deepEqual(await status(), expected("First observed request (also after resume); server cache warmth unknown."));
+
+  beforeRequest({ payload: request }, context("two"));
+  assert.deepEqual(await status(), expected("First observed request (also after resume); server cache warmth unknown."));
+  optIn = true;
+  beforeRequest({ payload: request }, context("two", { ...model, baseUrl: "https://gateway.example/v1" }));
+  assert.deepEqual(await status(), expected("First observed request (also after resume); server cache warmth unknown."));
 });
 
 test("native bash limits preserve complete output, Unicode, and supported read retrieval", async () => {

@@ -98,8 +98,9 @@ test("diagnostics distinguish first, repeated, appended and intentionally change
   assert.match(observe({ ...payload, tools: [] }, first.shape).status, /tool definitions/);
   const updated = { ...payload, messages: [{ role: "system", content: "new safety rules" }, payload.messages[1]] };
   assert.match(observe(updated, first.shape).status, /system instructions/);
-  const developer = { ...payload, messages: [{ role: "developer", content: "new safety rules" }, payload.messages[1]] };
-  assert.match(observe(developer, first.shape).status, /system instructions/);
+  const developer = { ...payload, messages: [{ role: "developer", content: "old safety rules" }, payload.messages[1]] };
+  const developerFirst = observe(developer);
+  assert.match(observe({ ...developer, messages: [{ role: "developer", content: "new safety rules" }, payload.messages[1]] }, developerFirst.shape).status, /system instructions/);
   assert.equal(project(updated).messages, updated.messages);
   assert.match(observe({ ...payload, messages: payload.messages.slice(0, 1) }, first.shape).status, /message prefix/);
   assert.equal(

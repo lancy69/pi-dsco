@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type ObjectValue = Record<string, unknown>;
 const isObject = (value: unknown): value is ObjectValue =>
@@ -12,17 +12,24 @@ export function canonicalize(value: unknown): unknown {
   return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]));
 }
 
-export function inScope(model: { api: string; baseUrl: string } | undefined, optIn = false): boolean {
-  if (model?.api !== "openai-completions") return false;
-  if (optIn) return true;
+function isDeepSeekEndpoint(url: URL): boolean {
+  return url.origin === "https://api.deepseek.com" &&
+    ["/", "/v1", "/v1/"].includes(url.pathname) &&
+    !url.username && !url.password && !url.search && !url.hash;
+}
+
+function hasVerifiedEndpoint(baseUrl: string): boolean {
   try {
-    const url = new URL(model.baseUrl);
-    return url.origin === "https://api.deepseek.com" &&
-      ["/", "/v1", "/v1/"].includes(url.pathname) &&
-      !url.username && !url.password && !url.search && !url.hash;
+    return isDeepSeekEndpoint(new URL(baseUrl));
   } catch {
     return false;
   }
+}
+
+export function inScope(model: { api: string; baseUrl: string } | undefined, optIn = false): boolean {
+  if (model?.api !== "openai-completions") return false;
+  if (optIn) return true;
+  return hasVerifiedEndpoint(model.baseUrl);
 }
 
 /** Copy only the tool surface. Never touch messages, results, or tool-call IDs. */
@@ -44,23 +51,40 @@ export function projectPayload(payload: unknown): unknown {
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value) ?? "undefined").digest("hex");
 type Shape = { system: string; tools: string; messages: string[] };
 
-/** Retain only hashes in memory, and report categories, never content or hashes. */
-export function observe(payload: unknown, previous?: Shape): { shape?: Shape; status: string } {
-  if (!isObject(payload) || !Array.isArray(payload.messages)) return { status: "Unsupported payload; no comparison." };
+function shapeOf(payload: unknown): Shape | undefined {
+  if (!isObject(payload)) return;
+  if (!Array.isArray(payload.messages)) return;
   const system = payload.messages.filter((message) => isObject(message) &&
     (message.role === "system" || message.role === "developer"));
-  const shape = { system: hash(system), tools: hash(payload.tools), messages: payload.messages.map(hash) };
-  if (!previous) return { shape, status: "First observed request (also after resume); server cache warmth unknown." };
+  return { system: hash(system), tools: hash(payload.tools), messages: payload.messages.map(hash) };
+}
+
+function shapeChanges(shape: Shape, previous: Shape): string[] {
   const changes: string[] = [];
   if (shape.system !== previous.system) changes.push("system instructions");
   if (shape.tools !== previous.tools) changes.push("tool definitions");
-  const prefixUnchanged = previous.messages.every((value, index) => value === shape.messages[index]);
-  if (!prefixUnchanged) changes.push("message prefix");
+  if (!previous.messages.every((value, index) => value === shape.messages[index])) changes.push("message prefix");
+  return changes;
+}
+
+const reuseStatus = (shape: Shape, previous: Shape) =>
+  `Subsequent request; ${shape.messages.length === previous.messages.length ? "identical" : "append-only"} observed prefix. Potential reuse only; not a cache hit.`;
+
+/** Retain only hashes in memory, and report categories, never content or hashes. */
+export function observe(payload: unknown, previous?: Shape): { shape?: Shape; status: string } {
+  const shape = shapeOf(payload);
+  if (!shape) return { status: "Unsupported payload; no comparison." };
+  if (!previous) return { shape, status: "First observed request (also after resume); server cache warmth unknown." };
+  const changes = shapeChanges(shape, previous);
   return {
     shape,
     status: changes.length ? `Subsequent request; changed: ${changes.join(", ")}.` :
-      `Subsequent request; ${shape.messages.length === previous.messages.length ? "identical" : "append-only"} observed prefix. Potential reuse only; not a cache hit.`,
+      reuseStatus(shape, previous),
   };
+}
+
+function requiresOptIn(model: ExtensionContext["model"], registry: ExtensionContext["modelRegistry"]): boolean {
+  return !!model && (registry.isUsingOAuth(model) || registry.getRegisteredProviderIds().includes(model.provider));
 }
 
 export default function dsco(pi: ExtensionAPI) {
@@ -79,9 +103,7 @@ export default function dsco(pi: ExtensionAPI) {
     const optIn = pi.getFlag("dsco-compatible") === true;
     // The hook exposes the selected model, not auth/transport URL overrides.
     // OAuth and extension-defined transports therefore require explicit opt-in.
-    const opaqueTransport = ctx.model && (ctx.modelRegistry.isUsingOAuth(ctx.model) ||
-      ctx.modelRegistry.getRegisteredProviderIds().includes(ctx.model.provider));
-    if ((!optIn && opaqueTransport) || !inScope(ctx.model, optIn)) {
+    if ((!optIn && requiresOptIn(ctx.model, ctx.modelRegistry)) || !inScope(ctx.model, optIn)) {
       reset();
       status = "Inactive for this endpoint or API; request unchanged.";
       return;

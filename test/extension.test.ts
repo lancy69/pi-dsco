@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -31,6 +32,7 @@ test("canonical JSON keys, Unicode, schema semantics, array order and prototype 
   assert.equal(JSON.stringify(a), before);
   assert.equal(Object.getPrototypeOf(canonicalize(a)), Object.prototype);
   assert.deepEqual(canonicalize([false, null, 2, "é😀"]), [false, null, 2, "é😀"]);
+  assert.equal(JSON.stringify(canonicalize([{ z: 1, a: 2 }])), '[{"a":2,"z":1}]');
 });
 
 test("request projection copies tools only, uses code-unit order, keeps calls/results/images", () => {
@@ -54,15 +56,29 @@ test("request projection copies tools only, uses code-unit order, keeps calls/re
   assert.equal(JSON.stringify(appended.tools), JSON.stringify(result.tools));
   const removed = project({ ...payload, tools: [tool("a")] });
   assert.deepEqual(removed.tools, [tool("a")]);
-  for (const tools of [[{ type: "custom", custom: { name: "x" } }], [{ ...tool("z"), cache_control: { type: "ephemeral" } }]]) {
+  assert.equal(projectPayload(null), null);
+  const withoutTools = { messages };
+  assert.equal(projectPayload(withoutTools), withoutTools);
+  for (const tools of [
+    [null],
+    [{ type: "custom", function: tool("x").function }],
+    [{ type: "function", function: null }],
+    [{ type: "function", function: { ...tool("x").function, name: 1 } }],
+    [{ type: "custom", custom: { name: "x" } }],
+    [{ ...tool("z"), cache_control: { type: "ephemeral" } }],
+    [{ ...tool("z"), function: { ...tool("z").function, cache_control: { type: "ephemeral" } } }],
+    [tool("a"), { type: "custom", function: tool("x").function }],
+  ]) {
     const unsupported = { messages, tools };
     assert.equal(projectPayload(unsupported), unsupported);
   }
+  const duplicates = project({ messages, tools: [tool("x", { order: 1 }), tool("x", { order: 2 })] });
+  assert.deepEqual((duplicates.tools as ReturnType<typeof tool>[]).map((t) => t.function.parameters), [{ order: 1 }, { order: 2 }]);
 });
 
 test("scope is exact endpoint/API, never a model-name guess", () => {
   assert.equal(inScope(model), true);
-  for (const baseUrl of ["https://api.deepseek.com/v1", "https://api.deepseek.com:443/"]) {
+  for (const baseUrl of ["https://api.deepseek.com/v1", "https://api.deepseek.com/v1/", "https://api.deepseek.com:443/"]) {
     assert.equal(inScope({ ...model, baseUrl }), true);
   }
   for (const baseUrl of ["https://gateway.example/deepseek", "https://api.deepseek.com.evil.test", "http://api.deepseek.com", "https://api.deepseek.com:444", "https://user@api.deepseek.com", "https://api.deepseek.com/anthropic", "https://api.deepseek.com/?route=other", "invalid"]) {
@@ -82,10 +98,21 @@ test("diagnostics distinguish first, repeated, appended and intentionally change
   assert.match(observe({ ...payload, tools: [] }, first.shape).status, /tool definitions/);
   const updated = { ...payload, messages: [{ role: "system", content: "new safety rules" }, payload.messages[1]] };
   assert.match(observe(updated, first.shape).status, /system instructions/);
+  const developer = { ...payload, messages: [{ role: "developer", content: "new safety rules" }, payload.messages[1]] };
+  assert.match(observe(developer, first.shape).status, /system instructions/);
   assert.equal(project(updated).messages, updated.messages);
   assert.match(observe({ ...payload, messages: payload.messages.slice(0, 1) }, first.shape).status, /message prefix/);
+  assert.equal(
+    observe({ messages: [{ role: "system", content: "changed" }], tools: [] }, first.shape).status,
+    "Subsequent request; changed: system instructions, tool definitions, message prefix.",
+  );
   assert.ok(!JSON.stringify(first).includes("secret"));
-  assert.equal(observe({}).shape, undefined);
+  assert.deepEqual(observe({}), { status: "Unsupported payload; no comparison." });
+  assert.deepEqual(observe(null), { status: "Unsupported payload; no comparison." });
+  assert.equal(
+    observe({ messages: [] }).shape?.tools,
+    createHash("sha256").update("undefined").digest("hex"),
+  );
 });
 
 test("native bash limits preserve complete output, Unicode, and supported read retrieval", async () => {
